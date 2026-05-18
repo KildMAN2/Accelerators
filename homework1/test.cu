@@ -1,17 +1,37 @@
 /* test.cu – Correctness tests for ex1 GPU implementations.
  *
- * Compile & run:  make test && ./test
+ * Tests are organised according to the assignment requirements:
+ *   Section 0 – Unit test : prefix_sum device function          (requirement 2a)
+ *   Section 1 – Correctness: GPU serial & bulk must match CPU   (requirements 3/4)
+ *   Section 2 – Known-output: verify m[v]=floor(CDF[v]/T²×255) analytically
+ *   Section 3 – Determinism: same input → same output
+ *   Section 4 – Performance: bulk must be ≥10× faster than serial (requirement 4f)
  *
- * Each test fills all N_IMAGES images with a specific pattern, runs the CPU
- * reference, the GPU task-serial implementation, and the GPU bulk
- * implementation, then verifies that both GPU outputs match the CPU output
- * exactly (squared-distance == 0).
+ * Compile & run:  make ex1 && make -f Makefile.test test && ./test
  */
 
 #include "ex1.h"
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+
+// ── prefix_sum is a __device__ function defined in ex1.cu.
+// With relocatable device code (-dc / RDC) both TUs are linked together so
+// we can call it from a test kernel after declaring it extern.
+extern __device__ void prefix_sum(int arr[], int arr_size);
+
+// Wrapper kernel: loads d_in into shared memory, calls prefix_sum, writes
+// the result back to d_out.
+__global__ void prefix_sum_test_kernel(int *d_in, int *d_out, int len)
+{
+    __shared__ int s[256];
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        s[i] = d_in[i];
+    __syncthreads();
+    prefix_sum(s, len);
+    for (int i = threadIdx.x; i < len; i += blockDim.x)
+        d_out[i] = s[i];
+}
 
 // ── image generators ────────────────────────────────────────────────────────
 
@@ -199,6 +219,183 @@ static long long sq_distance(const uchar *a, const uchar *b, size_t n)
     return d;
 }
 
+// ── Section 0: prefix_sum unit tests ────────────────────────────────────────
+// Requirement 2a: prefix_sum must compute an in-place inclusive prefix sum.
+static void run_prefix_sum_tests(int &passed, int &failed)
+{
+    struct Case { const char *name; int in[8]; int ex[8]; int len; };
+    static const Case cases[] = {
+        { "all ones   [1,1,1,1,1,1,1,1]",
+          {1,1,1,1,1,1,1,1}, {1,2,3,4,5,6,7,8}, 8 },
+        { "powers of 2 [1,2,4,8,16,32,64,128]",
+          {1,2,4,8,16,32,64,128}, {1,3,7,15,31,63,127,255}, 8 },
+        { "all zeros  [0,0,0,0,0,0,0,0]",
+          {0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0}, 8 },
+        { "single element [42]",
+          {42,0,0,0,0,0,0,0}, {42,0,0,0,0,0,0,0}, 1 },
+        { "ascending  [1,2,3,4,5,6,7,8]",
+          {1,2,3,4,5,6,7,8}, {1,3,6,10,15,21,28,36}, 8 },
+    };
+    const int NC = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    int *d_in, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_in,  256 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_out, 256 * sizeof(int)));
+
+    printf("=== Section 0: prefix_sum unit tests ===\n");
+    for (int c = 0; c < NC; c++) {
+        CUDA_CHECK(cudaMemcpy(d_in, cases[c].in,
+                              cases[c].len * sizeof(int), cudaMemcpyHostToDevice));
+        prefix_sum_test_kernel<<<1, 256>>>(d_in, d_out, cases[c].len);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        int res[8] = {};
+        CUDA_CHECK(cudaMemcpy(res, d_out,
+                              cases[c].len * sizeof(int), cudaMemcpyDeviceToHost));
+        bool ok = (memcmp(res, cases[c].ex, cases[c].len * sizeof(int)) == 0);
+        printf("  %-52s [%s]\n", cases[c].name, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            printf("    expected: ");
+            for (int i = 0; i < cases[c].len; i++) printf("%d ", cases[c].ex[i]);
+            printf("\n    got:      ");
+            for (int i = 0; i < cases[c].len; i++) printf("%d ", res[i]);
+            printf("\n");
+        }
+        if (ok) passed++; else failed++;
+    }
+
+    /* Full 256-bin histogram: uniform distribution (16 counts per bin).
+     * T=64, T²=4096; expected CDF: [16, 32, 48, ..., 4096]. */
+    {
+        int h_in[256], h_ex[256];
+        const int per_bin = TILE_WIDTH * TILE_WIDTH / 256; /* 16 */
+        for (int i = 0; i < 256; i++) h_in[i] = per_bin;
+        int run = 0;
+        for (int i = 0; i < 256; i++) { run += per_bin; h_ex[i] = run; }
+        CUDA_CHECK(cudaMemcpy(d_in, h_in, 256 * sizeof(int), cudaMemcpyHostToDevice));
+        prefix_sum_test_kernel<<<1, 256>>>(d_in, d_out, 256);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        int res[256];
+        CUDA_CHECK(cudaMemcpy(res, d_out, 256 * sizeof(int), cudaMemcpyDeviceToHost));
+        bool ok = (memcmp(res, h_ex, 256 * sizeof(int)) == 0);
+        printf("  %-52s [%s]\n",
+               "Uniform histogram 256 bins (16 each → CDF 16,32,..4096)",
+               ok ? "PASS" : "FAIL");
+        if (ok) passed++; else failed++;
+    }
+
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    printf("\n");
+}
+
+// ── Section 2: known-output tests ────────────────────────────────────────────
+// For a spatially uniform image (every tile has the same pixel distribution)
+// bilinear interpolation collapses to a simple map lookup because all four
+// tile-centre maps are identical:
+//   v' = (1-α)(1-β)m[v] + α(1-β)m[v] + (1-α)β m[v] + αβ m[v]  =  m[v]
+//
+// This lets us verify  m[v] = floor(CDF[v] / T² × 255)  pixel-by-pixel.
+static void run_known_output_tests(
+    struct task_serial_context *ts, struct gpu_bulk_context *gb,
+    uchar *imgs_in, uchar *imgs_serial, uchar *imgs_bulk,
+    int &passed, int &failed)
+{
+    const size_t total = (size_t)N_IMAGES * IMG_WIDTH * IMG_HEIGHT;
+    printf("=== Section 2: known-output tests (formula m[v]=floor(CDF[v]/T^2*255)) ===\n");
+
+    // ── Case A: constant image → every output pixel must be 255 ─────────────
+    // hist[v]=T²; CDF[v']=T² for all v'≥v; m[v]=floor(T²/T²×255)=255.
+    {
+        const uchar VALS[] = {0, 1, 128, 254, 255};
+        for (uchar val : VALS) {
+            memset(imgs_in, val, total);
+            task_serial_process(ts, imgs_in, imgs_serial);
+            gpu_bulk_process(gb, imgs_in, imgs_bulk);
+
+            bool ser_ok = true, bulk_ok = true;
+            for (size_t i = 0; i < total && ser_ok;  i++) ser_ok  = (imgs_serial[i] == 255);
+            for (size_t i = 0; i < total && bulk_ok; i++) bulk_ok = (imgs_bulk[i]   == 255);
+
+            char name[72];
+            snprintf(name, sizeof(name),
+                     "Constant val=%3d → all 255", (int)val);
+            bool ok = ser_ok && bulk_ok;
+            printf("  %-52s [%s]\n", name, ok ? "PASS" : "FAIL");
+            if (!ok) {
+                if (!ser_ok)  printf("    serial: found output pixel != 255\n");
+                if (!bulk_ok) printf("    bulk:   found output pixel != 255\n");
+            }
+            if (ok) passed++; else failed++;
+        }
+    }
+
+    // ── Case B: alternating 0/255 → pixel 0→127, pixel 255→255 ─────────────
+    // T=64, T²=4096. Each tile has exactly 2048 zeros + 2048 255s (T is even,
+    // IMG_WIDTH is even → every tile starts at an even flat index).
+    // CDF[0]=2048 → m[0]=floor(2048/4096×255)=floor(127.5)=127
+    // CDF[255]=4096 → m[255]=255
+    {
+        for (size_t i = 0; i < total; i++)
+            imgs_in[i] = (uchar)((i & 1) ? 255 : 0);
+
+        task_serial_process(ts, imgs_in, imgs_serial);
+        gpu_bulk_process(gb, imgs_in, imgs_bulk);
+
+        bool ser_ok = true, bulk_ok = true;
+        for (size_t i = 0; i < total && ser_ok;  i++) {
+            uchar exp = (uchar)((i & 1) ? 255 : 127);
+            ser_ok = (imgs_serial[i] == exp);
+        }
+        for (size_t i = 0; i < total && bulk_ok; i++) {
+            uchar exp = (uchar)((i & 1) ? 255 : 127);
+            bulk_ok = (imgs_bulk[i] == exp);
+        }
+        bool ok = ser_ok && bulk_ok;
+        printf("  %-52s [%s]\n",
+               "Alternating 0/255 → 127/255  (map formula)", ok ? "PASS" : "FAIL");
+        if (!ok && !ser_ok) {
+            for (size_t i = 0; i < total; i++) {
+                uchar exp = (uchar)((i & 1) ? 255 : 127);
+                if (imgs_serial[i] != exp) {
+                    printf("    serial mismatch pixel %zu: in=%d exp=%d got=%d\n",
+                           i, (int)imgs_in[i], (int)exp, (int)imgs_serial[i]);
+                    break;
+                }
+            }
+        }
+        if (ok) passed++; else failed++;
+    }
+
+    // ── Case C: alternating 64/192 → pixel 64→127, pixel 192→255 ────────────
+    // Same CDF analysis: two equally-represented values per tile.
+    // CDF[64]=2048 → m[64]=127;  CDF[192]=4096 → m[192]=255.
+    {
+        for (size_t i = 0; i < total; i++)
+            imgs_in[i] = (uchar)((i & 1) ? 192 : 64);
+
+        task_serial_process(ts, imgs_in, imgs_serial);
+        gpu_bulk_process(gb, imgs_in, imgs_bulk);
+
+        bool ser_ok = true, bulk_ok = true;
+        for (size_t i = 0; i < total && ser_ok;  i++) {
+            uchar exp = (uchar)((i & 1) ? 255 : 127);
+            ser_ok = (imgs_serial[i] == exp);
+        }
+        for (size_t i = 0; i < total && bulk_ok; i++) {
+            uchar exp = (uchar)((i & 1) ? 255 : 127);
+            bulk_ok = (imgs_bulk[i] == exp);
+        }
+        bool ok = ser_ok && bulk_ok;
+        printf("  %-52s [%s]\n",
+               "Alternating 64/192 → 127/255  (CDF accumulation)", ok ? "PASS" : "FAIL");
+        if (ok) passed++; else failed++;
+    }
+
+    printf("\n");
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main()
@@ -226,6 +423,9 @@ int main()
     struct gpu_bulk_context    *gb = gpu_bulk_init();
 
     int passed = 0, failed = 0;
+
+    // ── Section 0: prefix_sum unit tests ─────────────────────────────────
+    run_prefix_sum_tests(passed, failed);
 
     // ── Section 1: correctness ────────────────────────────────────────────
     printf("=== Correctness tests ===\n");
@@ -256,8 +456,11 @@ int main()
     }
     printf("%s\n\n", "------------------------------------------------------------------------------");
 
-    // ── Section 2: determinism – same input must give same output ─────────
-    printf("=== Determinism test (random seed 42, run twice) ===\n");
+    // ── Section 2: known-output tests ────────────────────────────────────
+    run_known_output_tests(ts, gb, imgs_in, imgs_serial, imgs_bulk, passed, failed);
+
+    // ── Section 3: determinism – same input must give same output ─────────
+    printf("=== Section 3: Determinism test (random seed 42, run twice) ===\n");
     fill_random(imgs_in, 42);
     gpu_bulk_process(gb, imgs_in, imgs_bulk);   /* run 1 */
     gpu_bulk_process(gb, imgs_in, imgs_bulk2);  /* run 2 */
@@ -269,7 +472,7 @@ int main()
     }
 
     // ── Section 3: performance – bulk must be >> faster than serial ───────
-    printf("=== Performance test ===\n");
+    printf("=== Section 4: Performance test (bulk must be >=10x faster than serial) ===\n");
     fill_random(imgs_in, 77);
 
     double t0 = get_time_msec();
@@ -288,7 +491,7 @@ int main()
     if (perf_ok) passed++; else failed++;
 
     // ── Summary ───────────────────────────────────────────────────────────
-    printf("%d / %d tests passed.\n", passed, N_TESTS + 2 /* determinism + perf */);
+    printf("%d / %d tests passed.\n", passed, passed + failed);
 
     /* ---- cleanup ---- */
     task_serial_free(ts);
