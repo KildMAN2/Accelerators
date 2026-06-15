@@ -77,9 +77,6 @@ void process_image_kernel(uchar *in, uchar *out, uchar* maps){
     process_image(in, out, maps);
 }
 
-/* =====================================================================
- * Part 1 — Streams server
- * ===================================================================== */
 
 class streams_server : public image_processing_server
 {
@@ -107,10 +104,10 @@ public:
     {
         for (int i = 0; i < STREAM_COUNT; ++i) {
             CUDA_CHECK(cudaStreamSynchronize(streams[i]));
-            CUDA_CHECK(cudaStreamDestroy(streams[i]));
             CUDA_CHECK(cudaFree(d_in[i]));
             CUDA_CHECK(cudaFree(d_out[i]));
             CUDA_CHECK(cudaFree(d_maps[i]));
+            CUDA_CHECK(cudaStreamDestroy(streams[i]));
         }
     }
 
@@ -121,8 +118,8 @@ public:
                 stream_img_id[i] = img_id;
                 CUDA_CHECK(cudaMemcpyAsync(d_in[i], img_in, IMG_SIZE,
                                            cudaMemcpyHostToDevice, streams[i]));
-                process_image_kernel<<<1, 1024, 0, streams[i]>>>(
-                    d_in[i], d_out[i], d_maps[i]);
+                process_image_kernel<<<1, 1024, 0, streams[i]>>>(d_in[i], d_out[i], d_maps[i]);
+                CUDA_CHECK( cudaGetLastError() );   // catch launch-config errors
                 CUDA_CHECK(cudaMemcpyAsync(img_out, d_out[i], IMG_SIZE,
                                            cudaMemcpyDeviceToHost, streams[i]));
                 return true;
@@ -158,9 +155,6 @@ std::unique_ptr<image_processing_server> create_streams_server()
     return std::make_unique<streams_server>();
 }
 
-/* =====================================================================
- * Part 2 — Producer/consumer queues
- * ===================================================================== */
 
 /* TTAS lock kept in GPU memory. Only GPU threads (one per block) take it. */
 struct gpu_lock {
@@ -319,7 +313,8 @@ static int compute_threadblocks_count(int threads_per_block)
 
     const int regs_per_thread  = 32;                          // -maxrregcount=32
     const int shmem_per_block  = sizeof(int) * HIST_SIZE      // hist[256]
-                               + 64                           // my_req + sig
+                               + sizeof(request_entry)        // my_req in persistent kernel
+                               + sizeof(int)                  // sig in persistent kernel
                                + 1024;                        // interpolate_device
 
     int by_threads = prop.maxThreadsPerMultiProcessor / threads_per_block;

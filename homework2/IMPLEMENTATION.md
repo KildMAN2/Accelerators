@@ -302,7 +302,7 @@ Because all three operations are enqueued to the same stream, CUDA preserves
 their order exactly:
 
 $$
-	ext{H2D copy} \rightarrow \text{kernel} \rightarrow \text{D2H copy}
+  ext{H2D copy} \rightarrow \text{kernel} \rightarrow \text{D2H copy}
 $$
 
 At the same time, different streams can run these pipelines concurrently, so
@@ -425,6 +425,36 @@ int blocks_per_sm = min({by_threads, by_regs, by_shmem, by_blocks});
 return blocks_per_sm * prop.multiProcessorCount;
 ```
 
+Formula used in words:
+
+$$
+	ext{blocks\_per\_SM} = \min\left(
+\left\lfloor\frac{T_{SM}}{T_{block}}\right\rfloor,
+\left\lfloor\frac{R_{SM}}{R_{thread}\cdot T_{block}}\right\rfloor,
+\left\lfloor\frac{S_{SM}}{S_{block}}\right\rfloor,
+B_{SM}^{max}
+\right)
+$$
+
+$$
+	ext{total\_blocks} = \text{blocks\_per\_SM} \cdot \text{SM\_count}
+$$
+
+Where the code gets each term:
+
+* $T_{SM}$, $R_{SM}$, $S_{SM}$, $B_{SM}^{max}$, and `SM_count` come from
+  `cudaGetDeviceProperties()`.
+* $T_{block}$ is the runtime argument (`threads` in queue mode).
+* $R_{thread}=32$ from `-maxrregcount=32` in the Makefile.
+* $S_{block}$ is computed as:
+
+  $$
+  S_{block} = \text{sizeof(hist[256])} + \text{sizeof(request\_entry)} + \text{sizeof(int)} + 1024
+  $$
+
+  The `1024` bytes are the assignment-given shared memory used by
+  `interpolate_device()`.
+
 The four ceilings correspond to the four hardware resources an SM has to
 share:
 
@@ -432,13 +462,13 @@ share:
 |--------------------------------|-------------------------------------------------|--------------------------|
 | Threads                        | `threads_per_block`                             | command-line parameter   |
 | Registers                      | `threads_per_block × 32`                        | `-maxrregcount=32`       |
-| Shared memory                  | `hist[256]·4 + ~64 + 1024 (interpolate_device)` | manual + spec            |
-| Absolute block cap per SM      | 1                                               | architectural constant   |
+| Shared memory                  | `hist[256]·4 + sizeof(request_entry) + sizeof(int) + 1024 (interpolate_device)` | manual + spec            |
+| Absolute block cap per SM      | `prop.maxBlocksPerMultiProcessor`              | `cudaGetDeviceProperties` |
 
-Nothing is hard-coded for a specific GPU — every property comes from
-`cudaGetDeviceProperties`. The constants 32 (registers) and 1024
-(interpolate_device shared memory) are dictated by the Makefile and the
-assignment, respectively.
+Nothing is hard-coded for a specific GPU model — all device limits are read
+at runtime via `cudaGetDeviceProperties`. The only fixed values are those
+given by the assignment/build setup: 32 registers per thread and 1024 bytes
+of shared memory inside `interpolate_device()`.
 
 On Turing (sm_75, 64 KB regs, 64 KB shared, 1024 threads, max 16 blocks per SM):
 * 1024 threads → 1 block/SM (capped by threads)
@@ -639,6 +669,28 @@ Destructor:
 `enqueue` returns `false` if the request queue is full (so the test
 harness retries); `dequeue` returns `false` if the response queue is
 empty.
+
+### 3.7 Why these choices (short rationale)
+
+This is the "why" behind the Part-2 design decisions:
+
+* **Persistent kernel instead of per-request launches:** removes repeated
+  kernel launch overhead and keeps GPU workers hot, which is better for a
+  server-like request stream.
+* **Single shared request/response queues:** gives natural load balancing;
+  whichever block becomes free can take the next request.
+* **Pinned host memory for queues (`cudaMallocHost`):** CPU and GPU can
+  access the same queue storage directly, enabling CPU↔GPU message passing.
+* **GPU-resident locks (`cudaMalloc`):** lock acquisition uses RMW atomics
+  (`exchange`), which must be local to the GPU for correctness.
+* **Release/acquire memory ordering:** guarantees queue payload visibility
+  before publishing queue indices; prevents stale or reordered reads.
+* **One lock per queue (`req_lock`, `resp_lock`):** minimizes critical
+  section scope while still serializing multi-block queue updates safely.
+* **Only thread 0 handles queue ops in each block:** reduces lock contention;
+  full block still participates in compute-heavy image processing.
+* **Stop flag + device synchronize in destructor:** ensures clean shutdown
+  (no stuck persistent kernel, no freeing memory while still in use).
 
 #### Worked example — a request through the queue server
 
