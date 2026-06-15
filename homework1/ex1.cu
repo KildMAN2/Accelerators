@@ -7,7 +7,7 @@
 /* Parallel inclusive prefix-sum (Kogge-Stone scan).
  * Requires blockDim.x >= arr_size. Each thread handles one element.
  * Runs in O(log arr_size) steps instead of O(arr_size) on a single thread. */
-_device_ void prefix_sum(int arr[], int arr_size) {
+__device__ void prefix_sum(int arr[], int arr_size) {
     if (threadIdx.x == 0) {
         for (int i = 1; i < arr_size; i++) {
             arr[i] += arr[i - 1];
@@ -30,16 +30,13 @@ void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
 /* Process one image per thread block.
  *   blockIdx.x  – selects which image (and corresponding maps) to process
  *   threadIdx.x – co-operates with other threads in the block             */
-/* Process one image per thread block.
- *   blockIdx.x  – selects which image (and corresponding maps) to process
- *   threadIdx.x – co-operates with other threads in the block             */
-_global_ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps) {
+__global__ void process_image_kernel(uchar *all_in, uchar *all_out, uchar *maps) {
     const int image_idx = blockIdx.x;
     uchar *img_in   = all_in  + (size_t)image_idx * IMG_WIDTH * IMG_HEIGHT;
     uchar *img_out  = all_out + (size_t)image_idx * IMG_WIDTH * IMG_HEIGHT;
     uchar *img_maps = maps    + (size_t)image_idx * TILE_COUNT * TILE_COUNT * 256;
 
-    _shared_ int hist[256];
+    __shared__ int hist[256];
 
     for (int tile_row = 0; tile_row < TILE_COUNT; tile_row++) {
         for (int tile_col = 0; tile_col < TILE_COUNT; tile_col++) {
