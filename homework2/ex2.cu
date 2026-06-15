@@ -10,14 +10,12 @@
 /* Parallel inclusive prefix-sum (Kogge-Stone scan).
  * Works for any blockDim.x >= arr_size: extra threads are masked out. */
 __device__ void prefix_sum(int arr[], int arr_size) {
-    int tid = threadIdx.x;
-    for (int stride = 1; stride < arr_size; stride <<= 1) {
-        int val = 0;
-        if (tid < arr_size && tid >= stride) val = arr[tid - stride];
-        __syncthreads();
-        if (tid < arr_size) arr[tid] += val;
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < arr_size; i++) {
+            arr[i] += arr[i - 1];
+        }
     }
+    __syncthreads();
 }
 
 /**
@@ -35,33 +33,42 @@ __device__
  * Works for blockDim.x in {256, 512, 1024}. */
 __device__
 void process_image(uchar *in, uchar *out, uchar* maps) {
-    __shared__ int hist[HIST_SIZE];
+    __shared__ int hist[256];
 
-    for (int tr = 0; tr < TILE_COUNT; ++tr) {
-        for (int tc = 0; tc < TILE_COUNT; ++tc) {
-            for (int i = threadIdx.x; i < HIST_SIZE; i += blockDim.x)
+    for (int tile_row = 0; tile_row < TILE_COUNT; tile_row++) {
+        for (int tile_col = 0; tile_col < TILE_COUNT; tile_col++) {
+            // Clear histogram
+            for (int i = threadIdx.x; i < 256; i += blockDim.x) {
                 hist[i] = 0;
-            __syncthreads();
-
-            const int tsr = tr * TILE_WIDTH;
-            const int tsc = tc * TILE_WIDTH;
-            const int tile_pixels = TILE_WIDTH * TILE_WIDTH;
-            for (int i = threadIdx.x; i < tile_pixels; i += blockDim.x) {
-                int row = tsr + i / TILE_WIDTH;
-                int col = tsc + i % TILE_WIDTH;
-                atomicAdd(&hist[in[row * IMG_WIDTH + col]], 1);
             }
             __syncthreads();
 
-            prefix_sum(hist, HIST_SIZE);
+            // Build histogram
+            const int tile_start_row = tile_row * TILE_WIDTH;
+            const int tile_start_col = tile_col * TILE_WIDTH;
+            const int tile_pixels    = TILE_WIDTH * TILE_WIDTH;
 
-            uchar *map = maps + (tr * TILE_COUNT + tc) * HIST_SIZE;
-            for (int i = threadIdx.x; i < HIST_SIZE; i += blockDim.x)
+            for (int i = threadIdx.x; i < tile_pixels; i += blockDim.x) {
+                int row = tile_start_row + i / TILE_WIDTH;
+                int col = tile_start_col + i % TILE_WIDTH;
+                uchar pixel = in[row * IMG_WIDTH + col];
+                atomicAdd(&hist[pixel], 1);
+            }
+            __syncthreads();
+
+            // Convert histogram to CDF (prefix sum)
+            prefix_sum(hist, 256);
+
+            // Compute the map m[v] = floor(CDF[v]/T^2 * 255)
+            uchar *map = maps + (tile_row * TILE_COUNT + tile_col) * 256;
+            for (int i = threadIdx.x; i < 256; i += blockDim.x) {
                 map[i] = (uchar)((hist[i] * 255) / tile_pixels);
+            }
             __syncthreads();
         }
     }
 
+   // Interpolate image
     interpolate_device(maps, in, out);
 }
 
