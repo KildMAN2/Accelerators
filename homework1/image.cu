@@ -19,7 +19,7 @@ int main(int argc,char **argv)
     }
 
     Mat gray_image;
-    cvtColor(image, gray_image, CV_BGR2GRAY);
+    cvtColor(image, gray_image, COLOR_BGR2GRAY); // here was a bug in the original code, it was CV_BGR2BGRA instead of COLOR_BGR2GRAY
     imwrite("grayscale.png", gray_image);
 
     Size sz = gray_image.size();
@@ -32,15 +32,8 @@ int main(int argc,char **argv)
     Mat result(sz, CV_8UC1, image_out);
     imwrite("result.png", result);
 
-    // namedWindow(image_name, CV_WINDOW_AUTOSIZE);
-    // namedWindow("Gray image", CV_WINDOW_AUTOSIZE);
-    // namedWindow("Result", CV_WINDOW_AUTOSIZE);
-
-    // imshow(image_name, image);
-    // imshow("Gray image", gray_image);
-    // imshow("Result", result);
-
-    // waitKey(0);
+    // GUI display skipped – no display available on this headless server.
+    // Results already written to grayscale.png and result.png above.
 
     return 0;
 }

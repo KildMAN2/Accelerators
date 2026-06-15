@@ -20,3 +20,7 @@ test: ex1.o test.o ex1-cpu.o
 
 clean:
 	rm -f test.o test
+
+cleanall:
+	$(MAKE) -f Makefile clean
+	$(MAKE) -f Makefile.test clean
