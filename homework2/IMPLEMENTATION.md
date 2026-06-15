@@ -278,6 +278,36 @@ stream and in order:
 Operations on the same stream execute in program order; operations on
 different streams may overlap. We never call `cudaStreamSynchronize` here.
 
+#### Why these 3 lines matter (line-by-line)
+
+```cpp
+CUDA_CHECK(cudaMemcpyAsync(d_in[i], img_in, IMG_SIZE,
+                  cudaMemcpyHostToDevice, streams[i]));
+process_image_kernel<<<1, 1024, 0, streams[i]>>>(
+   d_in[i], d_out[i], d_maps[i]);
+CUDA_CHECK(cudaMemcpyAsync(img_out, d_out[i], IMG_SIZE,
+                  cudaMemcpyDeviceToHost, streams[i]));
+```
+
+1. `cudaMemcpyAsync(...HostToDevice...)` enqueues an async input transfer
+  of one image from CPU pinned memory (`img_in`) into this stream's device
+  input buffer (`d_in[i]`).
+2. `process_image_kernel<<<..., streams[i]>>>` enqueues the GPU computation
+  for that same image in the same stream.
+3. `cudaMemcpyAsync(...DeviceToHost...)` enqueues an async output transfer
+  from this stream's device output buffer (`d_out[i]`) back to the caller's
+  host output (`img_out`).
+
+Because all three operations are enqueued to the same stream, CUDA preserves
+their order exactly:
+
+$$
+	ext{H2D copy} \rightarrow \text{kernel} \rightarrow \text{D2H copy}
+$$
+
+At the same time, different streams can run these pipelines concurrently, so
+copy and compute from different requests can overlap.
+
 ### `dequeue`
 Round-robin over occupied slots starting from `next_check`, calling
 `cudaStreamQuery(streams[i])`:
@@ -319,6 +349,64 @@ dequeue: cudaStreamQuery(stream 7) = cudaSuccess        → done!
 Because all three operations were placed on the *same* stream, they run in
 order; the D→H copy cannot start before the kernel finishes. Streams 0..63
 run independently, so up to 64 images are processed concurrently.
+
+### Streams measurements (tasks b/c/d)
+
+Measured with:
+
+```bash
+./ex2 streams 0
+./ex2 streams <load>
+```
+
+For cleaner reporting, I used:
+
+* 5 runs of `./ex2 streams 0`, and took the **median throughput** as `maxLoad`.
+* 3 repeats per load point in task (c), and reported **median throughput** and
+  **median latency**.
+
+`maxLoad` (median of 5 runs at `load=0`) was:
+
+```text
+maxLoad = 4239.1 req/sec
+```
+
+For task (c), load was varied from `maxLoad/10` to `2*maxLoad` in 10 equal
+steps. Collected samples (median across 3 repeats per point):
+
+| k | Load (req/sec) | Throughput (req/sec) | Median latency (ms) |
+|---|---------------:|---------------------:|--------------------:|
+| 0 |      423.91    |             420.9    |            7.8141   |
+| 1 |     1318.83    |            1306.4    |            8.3023   |
+| 2 |     2213.75    |            2179.2    |            9.2616   |
+| 3 |     3108.67    |            3053.1    |           11.4254   |
+| 4 |     4003.59    |            3782.7    |           21.7124   |
+| 5 |     4898.52    |            4201.7    |          226.2297   |
+| 6 |     5793.44    |            4240.0    |          378.9552   |
+| 7 |     6688.36    |            4252.1    |          441.8282   |
+| 8 |     7583.28    |            4259.3    |          525.5255   |
+| 9 |     8478.20    |            4244.3    |          618.9658   |
+
+Latency-throughput graph (task d), with linear X-axis and marked points:
+
+```mermaid
+xychart-beta
+    title "Streams: Median Latency vs Throughput"
+    x-axis "Throughput (req/sec)" 0 --> 4500
+    y-axis "Median latency (ms)" 0 --> 700
+    line "samples" [420.9, 1306.4, 2179.2, 3053.1, 3782.7, 4201.7, 4240.0, 4252.1, 4259.3, 4244.3] [7.8141, 8.3023, 9.2616, 11.4254, 21.7124, 226.2297, 378.9552, 441.8282, 525.5255, 618.9658]
+    scatter "points" [420.9, 1306.4, 2179.2, 3053.1, 3782.7, 4201.7, 4240.0, 4252.1, 4259.3, 4244.3] [7.8141, 8.3023, 9.2616, 11.4254, 21.7124, 226.2297, 378.9552, 441.8282, 525.5255, 618.9658]
+```
+
+What we learn from the graph:
+
+* At low-to-moderate load, throughput grows almost linearly while latency
+  stays low (~8-22 ms).
+* Around ~3.8k-4.2k req/sec, the curve reaches its knee and throughput
+  begins to saturate.
+* Beyond the knee, offered load keeps increasing but throughput remains near
+  ~4.2k req/sec, while latency rises steeply (hundreds of ms), indicating
+  queue buildup in a capacity-limited regime.
 
 ---
 
