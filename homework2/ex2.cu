@@ -210,19 +210,26 @@ public:
         return (t - h) >= capacity;
     }
 
-    /* Producer: write slot first, then publish via release store on tail. */
-    __device__ __host__ void push(const T &item) {
+    /* Producer: reject when full, else write slot then publish via release
+     * store on tail. Returns false if the queue was full. */
+    __device__ __host__ bool push(const T &item) {
         int t = tail.load(cuda::memory_order_relaxed);
+        int h = head.load(cuda::memory_order_acquire);
+        if ((t - h) >= capacity) return false;          // full
         slots()[t & mask] = item;
         tail.store(t + 1, cuda::memory_order_release);
+        return true;
     }
 
-    /* Consumer: read slot under acquire-ordered tail, then release head. */
-    __device__ __host__ T pop() {
+    /* Consumer: reject when empty, else read slot under acquire-ordered tail
+     * then release head. Returns false if the queue was empty. */
+    __device__ __host__ bool pop(T &item) {
         int h = head.load(cuda::memory_order_relaxed);
-        T item = slots()[h & mask];
+        int t = tail.load(cuda::memory_order_acquire);
+        if (h == t) return false;                       // empty
+        item = slots()[h & mask];
         head.store(h + 1, cuda::memory_order_release);
-        return item;
+        return true;
     }
 
     static size_t bytes(int cap) {
@@ -262,8 +269,7 @@ __global__ void persistent_kernel(queue_ctx ctx)
             sig = 0;
             for (;;) {
                 if (ctx.req_lock->try_lock()) {
-                    if (!ctx.req_q->is_empty()) {
-                        my_req = ctx.req_q->pop();
+                    if (ctx.req_q->pop(my_req)) {
                         ctx.req_lock->unlock();
                         sig = 2;
                         break;
@@ -285,11 +291,10 @@ __global__ void persistent_kernel(queue_ctx ctx)
         __syncthreads();
 
         if (threadIdx.x == 0) {
+            response_entry r{my_req.img_id};
             for (;;) {
                 if (ctx.resp_lock->try_lock()) {
-                    if (!ctx.resp_q->is_full()) {
-                        response_entry r{my_req.img_id};
-                        ctx.resp_q->push(r);
+                    if (ctx.resp_q->push(r)) {
                         ctx.resp_lock->unlock();
                         break;
                     }
@@ -415,17 +420,15 @@ public:
     /* Single CPU producer for req_q -- no CPU-side lock needed. */
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
-        if (req_q->is_full()) return false;
         request_entry r{img_id, img_in, img_out};
-        req_q->push(r);
-        return true;
+        return req_q->push(r);
     }
 
     /* Single CPU consumer for resp_q -- no CPU-side lock needed. */
     bool dequeue(int *img_id) override
     {
-        if (resp_q->is_empty()) return false;
-        response_entry r = resp_q->pop();
+        response_entry r;
+        if (!resp_q->pop(r)) return false;
         *img_id = r.img_id;
         return true;
     }

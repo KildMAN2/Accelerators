@@ -640,18 +640,23 @@ CPU ──enqueue──▶ req_q  ──dequeue──▶  GPU threadblocks
 GPU threadblocks ──enqueue──▶ resp_q ──dequeue──▶ CPU
 ```
 
-For each pair, the **producer side** does:
+For each pair, the **producer side** (`push`) does:
 
 ```
+int t = tail.load(memory_order_relaxed);
+int h = head.load(memory_order_acquire);             // ⓪ observe free slots
+if ((t - h) >= capacity) return false;               // full -> reject
 slots[t & mask] = item;                              // ① payload store
 tail.store(t + 1, memory_order_release);             // ② publish
 ```
 
-The **consumer side** does:
+The **consumer side** (`pop`) does:
 
 ```
+int h = head.load(memory_order_relaxed);
 int t = tail.load(memory_order_acquire);             // ③ observe publish
-if (h != t) { item = slots[h & mask]; ... }          // ④ payload load
+if (h == t) return false;                            // empty -> reject
+item = slots[h & mask];                              // ④ payload load
 head.store(h + 1, memory_order_release);             // ⑤ free slot
 ```
 
@@ -662,20 +667,20 @@ The happens-before edges we need are:
   consumer could read garbage from `slots[]`.
 * **Consumer → Producer:** ④ *happens-before* the next ① that overwrites
   the same slot. This is established by the release/acquire pair on `head`
-  (⑤ released by the consumer, acquired by the producer's `is_full`
-  check). Without this the producer could overwrite a slot the consumer
-  has not yet finished reading.
+  (⑤ released by the consumer, acquired by the producer's full check
+  inside `push`). Without this the producer could overwrite a slot the
+  consumer has not yet finished reading.
 
 In addition, on the *GPU side* the queue is multi-consumer (multi-producer
 for `resp_q`). The **critical section** guarded by `req_lock` /
 `resp_lock` is:
 
 ```
-{   is_empty()/is_full() check + slot read/write + head/tail update   }
+{   pop()/push() : empty/full check + slot read/write + head/tail update   }
 ```
 
 i.e. everything from observing the queue state to publishing the new
-state. The lock's `exchange(..., memory_order_acquire)` and
+state happens atomically inside a single `pop`/`push` call under the lock. The lock's `exchange(..., memory_order_acquire)` and
 `store(0, memory_order_release)` provide the inter-threadblock
 synchronization (one block's writes inside the critical section are
 visible to the next block that takes the lock).
@@ -697,8 +702,7 @@ __global__ void persistent_kernel(queue_ctx ctx) {
             sig = 0;
             for (;;) {
                 if (ctx.req_lock->try_lock()) {
-                    if (!ctx.req_q->is_empty()) {
-                        my_req = ctx.req_q->pop();
+                    if (ctx.req_q->pop(my_req)) {     // pop checks empty
                         ctx.req_lock->unlock();
                         sig = 2;  break;
                     }
@@ -717,10 +721,10 @@ __global__ void persistent_kernel(queue_ctx ctx) {
 
         // --- enqueue response (only thread 0) ---
         if (threadIdx.x == 0) {
+            response_entry r{my_req.img_id};
             for (;;) {
                 if (ctx.resp_lock->try_lock()) {
-                    if (!ctx.resp_q->is_full()) {
-                        ctx.resp_q->push({my_req.img_id});
+                    if (ctx.resp_q->push(r)) {        // push checks full
                         ctx.resp_lock->unlock(); break;
                     }
                     ctx.resp_lock->unlock();
