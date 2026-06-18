@@ -1,0 +1,4 @@
+streams maxload=26089.9000
+queue_1024 maxload=5948.4000
+queue_512 maxload=3393.5000
+queue_256 maxload=2698.9000

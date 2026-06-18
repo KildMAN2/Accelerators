@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+homework2/ex2
+homework2/hello-shmem
+homework1/ex1
+homework1/test
+
+# Editor/OS
+.DS_Store

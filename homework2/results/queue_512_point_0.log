@@ -1,0 +1,18 @@
+Number of devices: 4
+Using device 3
+
+=== Randomizing images ===
+total time 1025.751884 [msec]
+
+=== CPU ===
+total time 3113.352806 [msec]
+
+=== Client-Server ===
+mode = queue
+load = 339.4 (req/sec)
+threads = 512
+distance from baseline 0 (should be zero)
+throughput = 338.9 (req/sec)
+latency [msec]:
+         avg         min      median  99th perc.         max
+      2.0789      0.2487      2.0682      3.7256      4.1161

@@ -428,7 +428,7 @@ return blocks_per_sm * prop.multiProcessorCount;
 Formula used in words:
 
 $$
-	ext{blocks\_per\_SM} = \min\left(
+blocks_{per\_SM} = \min\left(
 \left\lfloor\frac{T_{SM}}{T_{block}}\right\rfloor,
 \left\lfloor\frac{R_{SM}}{R_{thread}\cdot T_{block}}\right\rfloor,
 \left\lfloor\frac{S_{SM}}{S_{block}}\right\rfloor,
@@ -437,7 +437,7 @@ B_{SM}^{max}
 $$
 
 $$
-	ext{total\_blocks} = \text{blocks\_per\_SM} \cdot \text{SM\_count}
+total_{blocks} = blocks_{per\_SM} \cdot SM_{count}
 $$
 
 Where the code gets each term:
@@ -476,6 +476,105 @@ On Turing (sm_75, 64 KB regs, 64 KB shared, 1024 threads, max 16 blocks per SM):
 * 256  threads → 4 blocks/SM (capped by threads)
 
 On a T4 (40 SMs) that yields 40 / 80 / 160 concurrent blocks respectively.
+
+### 3.1.1 Background: why this occupancy model is correct
+
+An SM can only host a block if **all** required resources are available at
+the same time.
+
+For one candidate block, the scheduler checks four constraints:
+
+* Thread slots: does the SM still have `threads_per_block` thread capacity?
+* Register file: can it reserve `threads_per_block * 32` registers?
+* Shared memory: can it reserve `shmem_per_block` bytes?
+* Architectural block limit: is the per-SM block counter below
+  `maxBlocksPerMultiProcessor`?
+
+If any one answer is "no", that extra block cannot be placed. This is why
+the valid block count is the minimum of all four ceilings. In other words,
+the tightest resource is the bottleneck resource.
+
+This is the same logic used by occupancy calculators: occupancy is not set by
+one "main" limit, but by whichever resource runs out first for the current
+kernel configuration.
+
+### 3.1.2 Why we compute this at runtime (and why it matters)
+
+The assignment asks for no hard-coded device-specific block count. Runtime
+calculation matters for two reasons:
+
+* Portability: different GPUs have different SM counts, register files,
+  shared-memory sizes, and max block limits.
+* Correct provisioning: `num_blocks` drives both persistent-kernel grid size
+  and queue capacity (`next_pow2(16 * num_blocks)`).
+
+If `num_blocks` is too low, GPU workers are underutilized and throughput
+drops. If it is too high, extra blocks cannot run concurrently, and queue/
+memory sizing may be inflated for no benefit.
+
+So this function is not just a "formula requirement". It determines how many
+persistent workers can actually execute together and therefore directly
+affects end-to-end server behavior.
+
+### 3.1.3 Beginner walkthrough (with numbers)
+
+You can read `compute_threadblocks_count()` as: "how many workers can one SM
+fit, then multiply by number of SMs."
+
+For each SM, we compute 4 candidates:
+
+* `by_threads = maxThreadsPerMultiProcessor / threads_per_block`
+* `by_regs    = regsPerMultiprocessor / (threads_per_block * 32)`
+* `by_shmem   = sharedMemPerMultiprocessor / shmem_per_block`
+* `by_blocks  = maxBlocksPerMultiProcessor`
+
+Then we take:
+
+* `blocks_per_sm = min(by_threads, by_regs, by_shmem, by_blocks)`
+
+because a block must satisfy all constraints at once.
+
+Worked example (typical T4-like values):
+
+* `maxThreadsPerMultiProcessor = 1024`
+* `regsPerMultiprocessor = 65536`
+* `sharedMemPerMultiprocessor = 65536`
+* `maxBlocksPerMultiProcessor = 16`
+* `shmem_per_block = hist(256*4) + request_entry + int + 1024 ≈ 2112 bytes`
+
+Case A: `threads_per_block = 1024`
+
+* `by_threads = 1024 / 1024 = 1`
+* `by_regs    = 65536 / (1024*32) = 2`
+* `by_shmem   = 65536 / 2112 = 31`
+* `by_blocks  = 16`
+* `blocks_per_sm = min(1,2,31,16) = 1`
+
+Case B: `threads_per_block = 512`
+
+* `by_threads = 1024 / 512 = 2`
+* `by_regs    = 65536 / (512*32) = 4`
+* `by_shmem   = 31`
+* `by_blocks  = 16`
+* `blocks_per_sm = min(2,4,31,16) = 2`
+
+Case C: `threads_per_block = 256`
+
+* `by_threads = 1024 / 256 = 4`
+* `by_regs    = 65536 / (256*32) = 8`
+* `by_shmem   = 31`
+* `by_blocks  = 16`
+* `blocks_per_sm = min(4,8,31,16) = 4`
+
+If the GPU has 40 SMs, total concurrent workers are:
+
+* `1*40 = 40` (1024 threads)
+* `2*40 = 80` (512 threads)
+* `4*40 = 160` (256 threads)
+
+This is exactly why the code computes the value dynamically instead of
+hard-coding: different GPUs will change these limits and therefore change
+the correct number of concurrent blocks.
 
 ### 3.2 The MPMC ring queue (`ring_queue<T>`)
 

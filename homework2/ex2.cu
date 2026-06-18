@@ -158,7 +158,7 @@ std::unique_ptr<image_processing_server> create_streams_server()
 
 /* TTAS lock kept in GPU memory. Only GPU threads (one per block) take it. */
 struct gpu_lock {
-    cuda::atomic<int> flag;
+    cuda::atomic<int, cuda::thread_scope_device> flag;
 
     __device__ void lock() {
         for (;;) {
@@ -181,8 +181,8 @@ struct gpu_lock {
 template <typename T>
 class ring_queue {
 public:
-    cuda::atomic<int> head;       // next slot to read  (consumer side)
-    cuda::atomic<int> tail;       // next slot to write (producer side)
+    cuda::atomic<int, cuda::thread_scope_system> head;       // next slot to read  (consumer side)
+    cuda::atomic<int, cuda::thread_scope_system> tail;       // next slot to write (producer side)
     int               capacity;   // power of 2
     int               mask;       // capacity - 1
 
@@ -192,8 +192,8 @@ public:
     }
 
     __host__ void init(int cap) {
-        new (&head) cuda::atomic<int>(0);
-        new (&tail) cuda::atomic<int>(0);
+        new (&head) cuda::atomic<int, cuda::thread_scope_system>(0);
+        new (&tail) cuda::atomic<int, cuda::thread_scope_system>(0);
         capacity = cap;
         mask     = cap - 1;
     }
@@ -245,7 +245,7 @@ struct queue_ctx {
     ring_queue<response_entry> *resp_q;
     gpu_lock                   *req_lock;     // protects GPU-side consumers
     gpu_lock                   *resp_lock;    // protects GPU-side producers
-    cuda::atomic<int>          *stop_flag;    // pinned host; system scope
+    cuda::atomic<int, cuda::thread_scope_system> *stop_flag;    // pinned host; system scope
     uchar                      *maps_pool;    // num_blocks * MAPS_PER_IMAGE
 };
 
@@ -346,7 +346,7 @@ private:
 
     gpu_lock          *d_req_lock;      // GPU memory
     gpu_lock          *d_resp_lock;     // GPU memory
-    cuda::atomic<int> *h_stop_flag;     // pinned host (system-scope atomic)
+    cuda::atomic<int, cuda::thread_scope_system> *h_stop_flag;     // pinned host (system-scope atomic)
 
     uchar *d_maps_pool;                 // per-block maps
 
@@ -373,8 +373,8 @@ public:
         CUDA_CHECK(cudaMemset(d_resp_lock, 0, sizeof(gpu_lock)));
 
         /* Stop flag in pinned host memory so the CPU can flip it cheaply. */
-        CUDA_CHECK(cudaMallocHost(&h_stop_flag, sizeof(cuda::atomic<int>)));
-        new (h_stop_flag) cuda::atomic<int>(0);
+        CUDA_CHECK(cudaMallocHost(&h_stop_flag, sizeof(cuda::atomic<int, cuda::thread_scope_system>)));
+        new (h_stop_flag) cuda::atomic<int, cuda::thread_scope_system>(0);
 
         /* Per-block scratch maps. */
         CUDA_CHECK(cudaMalloc(&d_maps_pool,
