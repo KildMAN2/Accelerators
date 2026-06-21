@@ -7,8 +7,7 @@
 #define MAPS_PER_IMAGE  (TILE_COUNT * TILE_COUNT * HIST_SIZE)
 #define IMG_SIZE        (IMG_WIDTH * IMG_HEIGHT)
 
-/* Parallel inclusive prefix-sum (Kogge-Stone scan).
- * Works for any blockDim.x >= arr_size: extra threads are masked out. */
+
 __device__ void prefix_sum(int arr[], int arr_size) {
     if (threadIdx.x == 0) {
         for (int i = 1; i < arr_size; i++) {
@@ -29,8 +28,7 @@ __device__ void prefix_sum(int arr[], int arr_size) {
 __device__
  void interpolate_device(uchar* maps ,uchar *in_img, uchar* out_img);
 
-/* Process one image. All threads of the block cooperate.
- * Works for blockDim.x in {256, 512, 1024}. */
+
 __device__
 void process_image(uchar *in, uchar *out, uchar* maps) {
     __shared__ int hist[256];
@@ -175,20 +173,18 @@ struct gpu_lock {
     }
 };
 
-/* MPMC ring queue stored in pinned host memory.
- * head/tail use system-scope atomics so the CPU and GPU synchronize via
- * release/acquire across PCIe. The slot buffer follows the header in memory. */
+
 template <typename T>
 class ring_queue {
 public:
-    cuda::atomic<int, cuda::thread_scope_system> head;       // next slot to read  (consumer side)
-    cuda::atomic<int, cuda::thread_scope_system> tail;       // next slot to write (producer side)
-    int               capacity;   // power of 2
-    int               mask;       // capacity - 1
+    cuda::atomic<int, cuda::thread_scope_system> head;   // next slot to read  (consumer)
+    cuda::atomic<int, cuda::thread_scope_system> tail;   // next slot to write (producer)
+    int capacity;   // power of 2
+    int mask;       // capacity - 1
 
     __device__ __host__ T *slots() {
-        return reinterpret_cast<T *>(reinterpret_cast<char *>(this)
-                                     + sizeof(ring_queue));
+        return reinterpret_cast<T *>(
+            reinterpret_cast<char *>(this) + sizeof(ring_queue));
     }
 
     __host__ void init(int cap) {
@@ -198,37 +194,25 @@ public:
         mask     = cap - 1;
     }
 
-    __device__ __host__ bool is_empty() {
-        int h = head.load(cuda::memory_order_acquire);
-        int t = tail.load(cuda::memory_order_acquire);
-        return h == t;
-    }
-
-    __device__ __host__ bool is_full() {
-        int t = tail.load(cuda::memory_order_relaxed);
-        int h = head.load(cuda::memory_order_acquire);
-        return (t - h) >= capacity;
-    }
-
-    /* Producer: reject when full, else write slot then publish via release
-     * store on tail. Returns false if the queue was full. */
-    __device__ __host__ bool push(const T &item) {
-        int t = tail.load(cuda::memory_order_relaxed);
-        int h = head.load(cuda::memory_order_acquire);
-        if ((t - h) >= capacity) return false;          // full
-        slots()[t & mask] = item;
-        tail.store(t + 1, cuda::memory_order_release);
+    /* Producer: bail if full, else write payload THEN publish via release. */
+    __device__ __host__ bool try_push(const T &item) {
+        int t = tail.load(cuda::memory_order_relaxed);   
+        int h = head.load(cuda::memory_order_acquire);   
+        if (t - h >= capacity)
+            return false;                                
+        slots()[t & mask] = item;                        
+        tail.store(t + 1, cuda::memory_order_release);   
         return true;
     }
 
-    /* Consumer: reject when empty, else read slot under acquire-ordered tail
-     * then release head. Returns false if the queue was empty. */
-    __device__ __host__ bool pop(T &item) {
-        int h = head.load(cuda::memory_order_relaxed);
-        int t = tail.load(cuda::memory_order_acquire);
-        if (h == t) return false;                       // empty
-        item = slots()[h & mask];
-        head.store(h + 1, cuda::memory_order_release);
+    /* Consumer: bail if empty, else read published payload THEN free via release. */
+    __device__ __host__ bool try_pop(T &out) {
+        int h = head.load(cuda::memory_order_relaxed);   
+        int t = tail.load(cuda::memory_order_acquire);   
+        if (h == t)
+            return false;                                
+        out = slots()[h & mask];                        
+        head.store(h + 1, cuda::memory_order_release);   
         return true;
     }
 
@@ -250,9 +234,9 @@ struct response_entry {
 struct queue_ctx {
     ring_queue<request_entry>  *req_q;
     ring_queue<response_entry> *resp_q;
-    gpu_lock                   *req_lock;     // protects GPU-side consumers
-    gpu_lock                   *resp_lock;    // protects GPU-side producers
-    cuda::atomic<int, cuda::thread_scope_system> *stop_flag;    // pinned host; system scope
+    gpu_lock                   *req_lock;     // GPU memory, device scope
+    gpu_lock                   *resp_lock;    // GPU memory, device scope
+    cuda::atomic<int, cuda::thread_scope_system> *stop_flag;   // pinned host, system scope
     uchar                      *maps_pool;    // num_blocks * MAPS_PER_IMAGE
 };
 
@@ -260,49 +244,46 @@ struct queue_ctx {
 __global__ void persistent_kernel(queue_ctx ctx)
 {
     __shared__ request_entry my_req;
-    __shared__ int           sig;        // 1 = stop, 2 = got request
+    __shared__ int           sig;        // 0 = nothing this round, 1 = stop, 2 = got request
 
     uchar *my_maps = ctx.maps_pool + (size_t)blockIdx.x * MAPS_PER_IMAGE;
 
     while (true) {
+        // ---- thread 0 makes ONE claim attempt, then the block decides uniformly ----
         if (threadIdx.x == 0) {
             sig = 0;
-            for (;;) {
-                if (ctx.req_lock->try_lock()) {
-                    if (ctx.req_q->pop(my_req)) {
-                        ctx.req_lock->unlock();
-                        sig = 2;
-                        break;
-                    }
-                    ctx.req_lock->unlock();
-                }
-                if (ctx.stop_flag->load(cuda::memory_order_acquire) != 0
-                    && ctx.req_q->is_empty()) {
-                    sig = 1;
-                    break;
-                }
+            int stop = ctx.stop_flag->load(cuda::memory_order_acquire);
+
+            if (ctx.req_lock->try_lock()) {
+                if (ctx.req_q->try_pop(my_req))
+                    sig = 2;                 // got a request
+                ctx.req_lock->unlock();
             }
+
+            // exit only when told to stop AND we got no work this round.
+            if (sig == 0 && stop)
+                sig = 1;
         }
-        __syncthreads();
+        __syncthreads();                    
 
-        if (sig == 1) break;
+        if (sig == 1) break;                 
+        if (sig != 2) continue;              
 
+        // ---- all threads process the image ----
         process_image(my_req.img_in, my_req.img_out, my_maps);
-        __syncthreads();
+        __syncthreads();                     // barrier 2: img_out fully written before publishing
 
         if (threadIdx.x == 0) {
             response_entry r{my_req.img_id};
-            for (;;) {
+            for (;;) {                       // producer retry is intentional 
                 if (ctx.resp_lock->try_lock()) {
-                    if (ctx.resp_q->push(r)) {
-                        ctx.resp_lock->unlock();
-                        break;
-                    }
+                    bool pushed = ctx.resp_q->try_push(r);
                     ctx.resp_lock->unlock();
+                    if (pushed) break;
                 }
             }
         }
-        __syncthreads();
+        __syncthreads();                 
     }
 }
 
@@ -316,11 +297,11 @@ static int compute_threadblocks_count(int threads_per_block)
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
 
-    const int regs_per_thread  = 32;                          // -maxrregcount=32
-    const int shmem_per_block  = sizeof(int) * HIST_SIZE      // hist[256]
-                               + sizeof(request_entry)        // my_req in persistent kernel
-                               + sizeof(int)                  // sig in persistent kernel
-                               + 1024;                        // interpolate_device
+    const int regs_per_thread  = 32;                         
+    const int shmem_per_block  = sizeof(int) * HIST_SIZE     
+                               + sizeof(request_entry)        
+                               + sizeof(int)                  
+                               + 1024;                      
 
     int by_threads = prop.maxThreadsPerMultiProcessor / threads_per_block;
     int by_regs    = prop.regsPerMultiprocessor / (threads_per_block * regs_per_thread);
@@ -361,29 +342,22 @@ public:
         num_blocks     = compute_threadblocks_count(threads);
         queue_capacity = next_pow2(16 * num_blocks);
 
-        /* Queues live in pinned host memory, shared with the GPU. */
-        CUDA_CHECK(cudaMallocHost(&req_q_buf,
-            ring_queue<request_entry>::bytes(queue_capacity)));
-        CUDA_CHECK(cudaMallocHost(&resp_q_buf,
-            ring_queue<response_entry>::bytes(queue_capacity)));
+        CUDA_CHECK(cudaMallocHost(&req_q_buf, ring_queue<request_entry>::bytes(queue_capacity)));
+        CUDA_CHECK(cudaMallocHost(&resp_q_buf, ring_queue<response_entry>::bytes(queue_capacity)));
         req_q  = reinterpret_cast<ring_queue<request_entry>  *>(req_q_buf);
         resp_q = reinterpret_cast<ring_queue<response_entry> *>(resp_q_buf);
         req_q->init(queue_capacity);
         resp_q->init(queue_capacity);
 
-        /* Locks live in GPU memory: RMW across PCIe is not atomic. */
         CUDA_CHECK(cudaMalloc(&d_req_lock,  sizeof(gpu_lock)));
         CUDA_CHECK(cudaMalloc(&d_resp_lock, sizeof(gpu_lock)));
         CUDA_CHECK(cudaMemset(d_req_lock,  0, sizeof(gpu_lock)));
         CUDA_CHECK(cudaMemset(d_resp_lock, 0, sizeof(gpu_lock)));
 
-        /* Stop flag in pinned host memory so the CPU can flip it cheaply. */
         CUDA_CHECK(cudaMallocHost(&h_stop_flag, sizeof(cuda::atomic<int, cuda::thread_scope_system>)));
         new (h_stop_flag) cuda::atomic<int, cuda::thread_scope_system>(0);
 
-        /* Per-block scratch maps. */
-        CUDA_CHECK(cudaMalloc(&d_maps_pool,
-                              (size_t)num_blocks * MAPS_PER_IMAGE));
+        CUDA_CHECK(cudaMalloc(&d_maps_pool, (size_t)num_blocks * MAPS_PER_IMAGE));
 
         queue_ctx ctx;
         ctx.req_q     = req_q;
@@ -421,14 +395,14 @@ public:
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         request_entry r{img_id, img_in, img_out};
-        return req_q->push(r);
+        return req_q->try_push(r);
     }
 
     /* Single CPU consumer for resp_q -- no CPU-side lock needed. */
     bool dequeue(int *img_id) override
     {
         response_entry r;
-        if (!resp_q->pop(r)) return false;
+        if (!resp_q->try_pop(r)) return false;
         *img_id = r.img_id;
         return true;
     }
